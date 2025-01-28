@@ -1,0 +1,223 @@
+#!/bin/bash
+
+# Define the Miniconda installation path
+MINICONDA_PATH="$HOME/miniconda3"
+
+# Remove existing Miniconda installation if present
+if [ -d "$MINICONDA_PATH" ]; then
+    echo "Found existing Miniconda installation at $MINICONDA_PATH. Removing..."
+    rm -rf "$MINICONDA_PATH"
+fi
+
+# Check if xclip is installed, and install it locally if not
+if ! command -v xclip &> /dev/null; then
+    echo "xclip not found. Installing xclip locally..."
+    mkdir -p ~/software/src
+    cd ~/software/src || exit
+    wget --no-check-certificate https://github.com/astrand/xclip/archive/refs/tags/0.13.tar.gz -O xclip-0.13.tar.gz
+    tar -xvzf xclip-0.13.tar.gz
+    cd xclip-0.13 || exit
+    ./bootstrap  # Generate configure script
+    ./configure --prefix=$HOME/software
+    make
+    make install
+    echo 'export PATH="$HOME/software/bin:$PATH"' >> ~/.bashrc
+    source ~/.bashrc
+    echo "xclip installed successfully."
+else
+    echo "xclip is already installed."
+fi
+
+# Download and install Miniconda
+echo "Downloading Miniconda..."
+wget --no-check-certificate https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh
+echo "Installing Miniconda..."
+bash /tmp/miniconda.sh -b -p "$MINICONDA_PATH"
+rm -f /tmp/miniconda.sh
+
+# Add Miniconda to PATH
+echo "Configuring environment..."
+export PATH="$MINICONDA_PATH/bin:$PATH"
+echo "export PATH=\"$MINICONDA_PATH/bin:\$PATH\"" >> ~/.bashrc
+
+# Initialize Conda for the current shell
+source "$MINICONDA_PATH/etc/profile.d/conda.sh"
+
+# Create environments
+echo "Creating environments..."
+conda create --name myenv python=3.10 -y
+conda create --name clipenv python=3.10 -y
+
+# Install packages in clipenv
+echo "Installing packages in clipenv..."
+conda activate clipenv
+conda install -c conda-forge pyperclip -y
+pip install openai
+
+# Create main.py with updated clipboard manager code
+echo "Creating main.py..."
+cat > main.py << 'EOL'
+#!/usr/bin/env python3
+import pyperclip
+import time
+import openai
+import threading
+import re
+
+# Configuration
+OPENAI_API_KEY = "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"  # Replace with your OpenAI API key
+VALUES = ["first", "second"]
+
+COMMAND_PREFIX = "$$"
+CHECK_INTERVAL = 0.3  # Seconds between clipboard checks
+cancel_current_request = False  # Global cancellation flag
+mcq_mode_enabled = False  # MCQ mode flag
+internal_change = False  # Internal clipboard change flag
+
+def get_openai_response(question, system_message=None):
+    """Get response from OpenAI's GPT-4o model"""
+    try:
+        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        messages = [
+            {"role": "system", "content": system_message or "You are a helpful assistant"},
+            {"role": "user", "content": question}
+        ]
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+def get_mcq_answer(question_text):
+    """Get formatted MCQ answer using OpenAI"""
+    system_msg = (
+        "You are an expert at solving multiple choice questions. "
+        "Return only the correct option number and content in the format '<number> <content>'. "
+        "Example: '2 Paris'. No explanations or other text."
+    )
+    answer = get_openai_response(question_text, system_msg)
+    # Validate answer format
+    if re.match(r'^\d+\s+.+', answer):
+        return answer
+    return f"Error: Unexpected answer format - {answer}"
+
+def handle_api_request(question, api):
+    """Handle API request in a thread"""
+    global cancel_current_request, internal_change
+    cancel_current_request = False  # Reset flag for new request
+
+    if api == "openai":
+        answer = get_openai_response(question)
+    else:
+        answer = "Invalid API specified."
+
+    if not cancel_current_request:
+        pyperclip.copy(answer)
+        internal_change = True
+
+def handle_mcq_request(question):
+    """Handle MCQ processing in a thread"""
+    global mcq_mode_enabled, internal_change
+    answer = get_mcq_answer(question)
+    if mcq_mode_enabled:
+        pyperclip.copy(answer)
+        internal_change = True
+
+def process_command(content):
+    """Handle clipboard commands and return True if program should exit"""
+    global cancel_current_request, mcq_mode_enabled, internal_change
+    content = content.strip()
+
+    if content == f"{COMMAND_PREFIX}quit69":
+        return True
+
+    if content == f"{COMMAND_PREFIX}reset":
+        cancel_current_request = True
+        pyperclip.copy("Program reset. Monitoring clipboard...")
+        internal_change = True
+        return False
+
+    if content == f"{COMMAND_PREFIX}mcqon":
+        mcq_mode_enabled = True
+        pyperclip.copy("MCQ mode enabled. Monitoring for questions...")
+        internal_change = True
+        return False
+
+    if content == f"{COMMAND_PREFIX}mcqoff":
+        mcq_mode_enabled = False
+        pyperclip.copy("MCQ mode disabled.")
+        internal_change = True
+        return False
+
+    if content.startswith(f"{COMMAND_PREFIX}help"):
+        pyperclip.copy("Processing...")
+        internal_change = True
+        question = content[len(f"{COMMAND_PREFIX}help"):].lstrip()
+        threading.Thread(target=handle_api_request, args=(question, "openai")).start()
+        return False
+
+    if content.startswith(COMMAND_PREFIX):
+        try:
+            index = int(content[len(COMMAND_PREFIX):]) - 1
+            if 0 <= index < len(VALUES):
+                pyperclip.copy(VALUES[index])
+                internal_change = True
+            else:
+                pyperclip.copy("Invalid value index")
+                internal_change = True
+        except ValueError:
+            pyperclip.copy("Invalid command format")
+            internal_change = True
+
+    return False
+
+def main():
+    global mcq_mode_enabled, internal_change
+    print("Clipboard manager started. Monitoring clipboard...")
+    last_content = ""
+
+    try:
+        while True:
+            current_content = pyperclip.paste()
+
+            # Handle internal changes
+            if internal_change:
+                last_content = current_content
+                internal_change = False
+                time.sleep(CHECK_INTERVAL)
+                continue
+
+            if current_content != last_content:
+                if current_content.startswith(COMMAND_PREFIX):
+                    should_exit = process_command(current_content)
+                    if should_exit:
+                        break
+                    # Update last_content after command processing
+                    last_content = pyperclip.paste()
+                else:
+                    if mcq_mode_enabled:
+                        threading.Thread(target=handle_mcq_request, args=(current_content,)).start()
+                    last_content = current_content
+            else:
+                last_content = current_content
+
+            time.sleep(CHECK_INTERVAL)
+
+    except KeyboardInterrupt:
+        pass
+
+    print("Clipboard manager stopped.")
+
+if __name__ == "__main__":
+    main()
+EOL
+
+# Initialize Conda for the current shell
+source "$MINICONDA_PATH/etc/profile.d/conda.sh"
+
+# Run the program
+echo "Starting clipboard manager..."
+conda activate clipenv
+python main.py
